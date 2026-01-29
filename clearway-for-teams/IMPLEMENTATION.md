@@ -1,67 +1,59 @@
-# Implementation Plan & Reverse Engineering Notes
+# Teams Bridge: Reverse Engineering & Implementation Details
 
 ## Goal
-Create a read-only, unidirectional bridge to read Microsoft Teams (Work/School, "New Teams") conversation history and messages from the local database.
+Build a read-only bridge for "New Teams" (V2) to extract and display conversation history and unread status.
 
-## Reverse Engineering Context
+## Reverse Engineering Findings
 
-### Target Application
-- **Name**: Microsoft Teams (New / V2)
-- **Type**: Windows Store App / MSIX (WebView2 / Edge based)
-- **Package Name**: `MSTeams_8wekyb3d8bbwe`
-- **Primary Data Path**: `C:\Users\mark\AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\IndexedDB\https_teams.microsoft.com_0.indexeddb.leveldb`
+### Database Location
+- **Registry/Path**: `%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\IndexedDB\https_teams.microsoft.com_0.indexeddb.leveldb`
+- **Format**: Chromium IndexedDB (backed by LevelDB).
 
-### Database Schema (IndexedDB)
-Research has identified the following critical databases and stores:
+### Database & Store Mapping
 
-| Data Type | Database Name Snippet | Store Name |
-| :--- | :--- | :--- |
-| **Conversations** | `Teams:conversation-manager` | `conversations` |
-| **Messages** | `Teams:replychain-manager` | `replychains` |
-| **User Profiles** | `Teams:profiles` | `profiles` |
-| **Sync State** | `Teams:syncstate-manager` | `syncstates` |
-| **Read Status** | `Teams:replychain-metadata-manager` | `replychainmetadata` |
+The application spreads data across numerous IndexedDB databases. Key mappings identified:
 
-### Unread Logic
-Unread messages are determined by comparing the `originalArrivalTimestamp` of a message with the `consumptionHorizon` found in the `replychainmetadata` store for that specific conversation.
-- **Consumption Horizon**: The timestamp (ms) of the last message the user acknowledged as "read".
-- **Unread Rule**: `message.timestamp > conversation.consumptionHorizon`
+| Content Type | Database Name Snippet | Store Index | Store Name | Key Fields |
+| :--- | :--- | :--- | :--- | :--- |
+| **Conversations** | `Teams:conversation-manager` | 1 | `conversations` | `id`, `threadProperties`, `version`, `source` |
+| **Messages Cache** | `Teams:replychain-manager` | 1 | `replychains` | `conversationId`, `originalArrivalTimestamp`, `content`, `creatorMri` |
+| **Read Markers** | `Teams:replychain-metadata-manager` | 1 | `replychainmetadata` | `conversationId`, `consumptionHorizon` |
+| **User Profiles** | `Teams:profiles` | 1 | `profiles` | `mri`, `displayName`, `mail` |
+| **Unread Summary** | `Teams:messaging-slice-manager` | 2 | `threads-internal-items` | `unreadCount`, `totalCount` (Summary only) |
 
-### Data Storage
-- **Format**: LevelDB (via Chromium IndexedDB)
-- **Structure**:
-    - Chromium IndexedDB stores data in LevelDB.
-    - Keys are complex, often containing store ID, index ID, and serialized keys.
-    - Values are typically V8 serialized objects or similar binary formats.
-    - We need to decode the specific "ObjectStores" used by Teams (e.g., `reply_chain`, `conversations`, `messages`).
+### Technical Challenges & Logic
 
-### Challenges
-1.  **File Locking**: LevelDB locks the database when open. The Teams client will likely hold a lock.
-    - *Solution*: Copy the entire database directory to a temporary location before reading.
-2.  **Decoding**: The keys and values are binary encoded.
-    - We need to identify the correct object store IDs.
-    - We need to decode the V8 serialized values (or whatever serialization Teams uses - possibly JSON or Protobuf inside the V8 wrapper).
+#### 1. Database Locking
+Chromium DBs are locked when Teams is running. 
+- **Solution**: The bridge copies the entire `.leveldb` folder to `%TEMP%` before opening. The `LOCK` file is ignored during copy.
 
-## Proposed Architecture
+#### 2. Deduplication & Conflicts
+Teams stores multiple records for the same conversation ID across different "sources" (e.g., Sources 4, 5, 6).
+- **Rule**: Sort by `version` or `detailsVersion` descending.
+- **Source Conflict**: If versions are identical, the record with `isRead: False` in `threadProperties` is preferred to ensure unread messages are surfaced.
 
-### Core Script (`read_teams.py`)
-1.  **Snapshot**: Copy the LevelDB folder to a temp dir.
-2.  **Read**: Open the copy using a LevelDB library (`plyvel` or similar).
-3.  **Iterate**: Walk through keys.
-    - Filter for relevant object stores (need to reverse engineer which IDs correspond to "messages").
-    - Heuristic: Look for JSON-like structures containing "content", "messageBody", "conversationId".
-4.  **Parse**: Extract timestamp, sender, content, thread ID.
-5.  **Output**: Print or return typed Python objects.
+#### 3. Unread Detection (Heuristic Approach)
+The "Unread" count in the Teams UI is complex. The bridge uses a multi-layered detection:
+1.  **Consumption Horizon**: If `originalArrivalTimestamp > consumptionHorizon`, the message is considered unread.
+2.  **Metadata Flag**: `threadProperties.isRead` (Boolean) provides a direct indicator from the conversation manager.
+3.  **Recency Filter**: To match the user's "Active" view, the bridge applies a 7-day recency window and filters out `threadType: meeting` or hidden chats.
+
+#### 4. Message Enrichment
+Messages in `replychains` contain MRIs (e.g., `8:orgid:uuid`). The bridge joins these with the `profiles` database to display human-readable names.
+
+## Project Architecture
+
+- `teams_bridge.py`: Core `TeamsExtractor` class. Handles snapshotting, DB iteration via `ccl-chromium-reader`, schema mapping, and deduplication.
+- `viewer.py`: Textual-based TUI. Displays a list of conversations with unread counts and a message pane.
+- `unread.py`: CLI utility for quick unread summaries, focusing on active direct chats.
 
 ## Dependencies
-- `plyvel` (or `plyvel-wheels` for easier Windows install)
-- `typing` (standard)
-- `shutil` (standard)
 
-## User Review Required
-- **Privacy**: This script accesses sensitive conversation data.
-- **Stability**: Reading internal DB formats is brittle and may break with Teams updates.
+- `ccl-chromium-reader`: Essential for parsing the Chromium IndexedDB structure without C++ compilers.
+- `textual`: Modern TUI framework.
+- `pydantic` / `dataclasses`: For strict data modeling.
 
-## Next Steps
-1.  Create a prototype script to dump raw keys/values to identify the structure.
-2.  Refine the script to parse the specific message schema.
+## Known Limitations
+- **Read-Only**: No ability to send messages or mark them as read in the official DB (requires API interaction).
+- **Local Cache**: Only displays messages cached locally by the Teams client.
+- **Schema Volatility**: Microsoft changes internal store structures frequently.

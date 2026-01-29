@@ -102,8 +102,8 @@ class TeamsViewer(App):
             conv_list = self.query_one("#conv-list", ListView)
             conv_list.clear()
             for conv in self.conversations:
-                # Only show conversations with messages
-                if not conv.messages:
+                # Only show conversations with messages OR if they are unread
+                if not conv.messages and conv.unread_count == 0:
                     continue
                     
                 # Use display name or ID, truncate if needed

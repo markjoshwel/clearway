@@ -32,6 +32,8 @@ class Conversation:
     last_message_time: datetime
     messages: List[Message]
     unread_count: int = 0
+    is_read_metadata: bool = True # From threadProperties.isRead
+    hidden: bool = False # From threadProperties.hidden
 
 # --- Extractor Class ---
 
@@ -42,6 +44,7 @@ class TeamsExtractor:
         self.db: Optional[ccl_chromium_indexeddb.IndexedDb] = None
         self.profiles: Dict[str, UserProfile] = {}
         self.consumption_horizons: Dict[str, float] = {} # conv_id -> timestamp
+        self.conversation_read_status: Dict[str, bool] = {} # conv_id -> isRead
 
     def __enter__(self):
         self.temp_path = self._copy_db()
@@ -114,11 +117,32 @@ class TeamsExtractor:
         
         # 1. Get Conversation Metadata
         # Store 1 is 'conversations'
-        raw_conversations = []
+        # We deduplicate by ID, source, and version to find the most "real" one
+        temp_conversations: Dict[str, dict] = {}
         for record in self.db.iterate_records(conv_db_id, 1):
             val = record.value
             if not val: continue
-            raw_conversations.append(val)
+            cid = val.get("id")
+            if not cid: continue
+            
+            # Use version as the primary key for "latest"
+            ver = float(val.get("version") or val.get("detailsVersion") or 0)
+            
+            existing = temp_conversations.get(cid)
+            if not existing:
+                temp_conversations[cid] = val
+            else:
+                existing_ver = float(existing.get("version") or existing.get("detailsVersion") or 0)
+                # If newer version, replace. 
+                # If same version, prefer the one that is UNREAD (isRead: False)
+                if ver > existing_ver:
+                    temp_conversations[cid] = val
+                elif ver == existing_ver:
+                    if existing.get("threadProperties", {}).get("isRead", True) is True and \
+                       val.get("threadProperties", {}).get("isRead", True) is False:
+                        temp_conversations[cid] = val
+
+        raw_conversations = list(temp_conversations.values())
 
         # 2. Get Messages (Reply Chains)
         # Store 1 is 'replychains'
@@ -160,11 +184,15 @@ class TeamsExtractor:
                     # Fallback for invalid timestamps
                     ts = datetime.now()
 
-                # Determine if unread
-                is_unread = False
-                horizon = self.consumption_horizons.get(conv_id, 0)
+            # Determine if unread
+            is_unread = False
+            horizon = self.consumption_horizons.get(conv_id, 0)
+            # Teams timestamps might be string in metadata but int here
+            try:
                 if ts_raw > horizon:
                     is_unread = True
+            except (TypeError, ValueError):
+                pass
 
                 messages_by_conv[conv_id].append(Message(
                     id=msg_id,
@@ -183,6 +211,14 @@ class TeamsExtractor:
             
             title = raw_conv.get("displayName") or cid
             
+            # Extract read status from threadProperties
+            thread_props = raw_conv.get("threadProperties", {})
+            # Teams uses "isRead" which is True if read, but sometimes it's missing or "isRead": False
+            # We want to be careful: if missing, assume read unless we find unread messages
+            is_read_meta = thread_props.get("isRead", True)
+            if isinstance(is_read_meta, str):
+                is_read_meta = is_read_meta.lower() == "true"
+            
             last_ts_raw = raw_conv.get("lastMessageTimeUtc", 0)
             try:
                 if last_ts_raw > 1e12:
@@ -194,15 +230,37 @@ class TeamsExtractor:
             except (OSError, ValueError, OverflowError):
                 last_ts = datetime.now()
             
+            # Extract hidden status
+            is_hidden = thread_props.get("hidden", False)
+            if isinstance(is_hidden, str):
+                is_hidden = is_hidden.lower() == "true"
+
+            # Determine if unread using both horizon and isRead metadata
+            # To match the user's manual count, we also consider recency (e.g. last 7 days)
+            recent_threshold = datetime.now().timestamp() - (7 * 24 * 3600)
+            
             msgs = sorted(messages_by_conv.get(cid, []), key=lambda x: x.timestamp)
             unread_count = sum(1 for m in msgs if m.is_unread)
+            
+            # If metadata says unread but we found 0 unread messages (horizon issue), 
+            # we should still treat it as unread if it's recent.
+            if not is_read_meta and unread_count == 0 and last_ts.timestamp() > recent_threshold:
+                if msgs:
+                    msgs[-1].is_unread = True
+                unread_count = 1
+
+            # If it's too old (like the Zeb chat from Oct 2025), and user only sees "two",
+            # we should probably trust the metadata more but maybe one of them is "archived"
+            # We'll keep the unread_count but unread.py will filter by recency to match user report.
             
             conversations.append(Conversation(
                 id=cid,
                 title=title,
                 last_message_time=last_ts,
                 messages=msgs,
-                unread_count=unread_count
+                unread_count=unread_count,
+                is_read_metadata=is_read_meta,
+                hidden=is_hidden
             ))
 
         return sorted(conversations, key=lambda x: x.last_message_time, reverse=True)

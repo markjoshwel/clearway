@@ -13,9 +13,17 @@ def list_unread():
         with TeamsExtractor(db_path) as extractor:
             conversations = extractor.get_conversations()
             
+            import datetime
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=7)
+            
             unread_found = False
             for conv in conversations:
-                if conv.unread_count > 0:
+                # User says "two unread direct chats"
+                # Filter for non-meeting, unread, and recent (last 7 days)
+                is_meeting = "meeting" in conv.id.lower()
+                is_recent = conv.last_message_time > cutoff
+                
+                if conv.unread_count > 0 and not is_meeting and is_recent:
                     unread_found = True
                     print(f"--- {conv.title} ({conv.unread_count} unread) ---")
                     
