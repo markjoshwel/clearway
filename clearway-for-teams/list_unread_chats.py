@@ -3,27 +3,27 @@ from pathlib import Path
 from datetime import datetime
 from teams_bridge import TeamsExtractor
 
-def list_unread():
+def list_unread_chats():
     app_data = os.environ.get("LOCALAPPDATA", "")
     db_path = Path(app_data) / "Packages/MSTeams_8wekyb3d8bbwe/LocalCache/Microsoft/MSTeams/EBWebView/WV2Profile_tfw/IndexedDB/https_teams.microsoft.com_0.indexeddb.leveldb"
 
-    print(f"Checking for unread Teams messages...\n")
+    print(f"Checking for unread Teams Chats (1:1 & Group)...\n")
     
     try:
         with TeamsExtractor(db_path) as extractor:
             conversations = extractor.get_conversations()
             
             import datetime
-            cutoff = datetime.datetime.now() - datetime.timedelta(days=7)
-            
             unread_found = False
             for conv in conversations:
-                # User says "two unread direct chats"
-                # Filter for non-meeting, unread, and recent (last 7 days)
-                is_meeting = "meeting" in conv.id.lower()
-                is_recent = conv.last_message_time > cutoff
+                # Filter for thread_type 'Chat'
+                if conv.thread_type != "Chat":
+                    continue
                 
-                if conv.unread_count > 0 and not is_meeting and is_recent:
+                # Exclude meetings even if they are 'Chat' types
+                is_meeting = "meeting" in conv.id.lower()
+                
+                if conv.unread_count > 0 and not is_meeting:
                     unread_found = True
                     print(f"--- {conv.title} ({conv.unread_count} unread) ---")
                     
@@ -35,10 +35,10 @@ def list_unread():
                     print()
             
             if not unread_found:
-                print("No unread messages found.")
+                print("No unread direct chats found.")
 
     except Exception as e:
         print(f"Error: {e}")
 
 if __name__ == "__main__":
-    list_unread()
+    list_unread_chats()

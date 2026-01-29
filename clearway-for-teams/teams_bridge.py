@@ -34,6 +34,7 @@ class Conversation:
     unread_count: int = 0
     is_read_metadata: bool = True # From threadProperties.isRead
     hidden: bool = False # From threadProperties.hidden
+    thread_type: str = "Chat" # Chat or Topic
 
 # --- Extractor Class ---
 
@@ -98,10 +99,21 @@ class TeamsExtractor:
             
             conv_id = val.get("conversationId")
             # This is the timestamp of the last READ message
-            horizon = val.get("consumptionHorizon")
-            if conv_id and horizon:
+            # Semicolon separated list, we should take the max valid one
+            horizon_raw = val.get("consumptionHorizon")
+            if conv_id and horizon_raw:
                 try:
-                    self.consumption_horizons[conv_id] = float(horizon)
+                    parts = str(horizon_raw).split(';')
+                    max_h = 0.0
+                    for p in parts:
+                        try:
+                            val_f = float(p.strip())
+                            if val_f > max_h:
+                                max_h = val_f
+                        except (ValueError, TypeError):
+                            continue
+                    if max_h > 0:
+                        self.consumption_horizons[conv_id] = max_h
                 except (ValueError, TypeError):
                     pass
 
@@ -206,13 +218,38 @@ class TeamsExtractor:
 
         # 3. Assemble
         for raw_conv in raw_conversations:
-            cid = raw_conv.get("id")
-            if not cid: continue
+            # Improved Thread Type detection
+            thread_type = raw_conv.get("threadType")
+            cid = raw_conv.get("id", "")
             
-            title = raw_conv.get("displayName") or cid
-            
-            # Extract read status from threadProperties
+            if not thread_type:
+                if "@thread.tacv2" in cid or "@thread.v2" in cid:
+                    thread_type = "Topic"
+                elif "meeting_" in cid:
+                    thread_type = "Meeting"
+                else:
+                    thread_type = "Chat"
+
             thread_props = raw_conv.get("threadProperties", {})
+            title = raw_conv.get("displayName") or raw_conv.get("topic") or cid
+            
+            # For Channels (Topics) or Spaces (Teams)
+            is_space = raw_conv.get("type") == "Space"
+            if thread_type == "Topic" or is_space:
+                # Try to get the Team name from diversos fields
+                team_name = raw_conv.get("displayName") or \
+                            thread_props.get("spaceThreadTopic") or \
+                            thread_props.get("description")
+                
+                channel_name = raw_conv.get("topic")
+                
+                if team_name and channel_name and team_name != channel_name:
+                    title = f"{team_name} > {channel_name}"
+                elif channel_name:
+                    title = channel_name
+                elif team_name:
+                    title = team_name
+            
             # Teams uses "isRead" which is True if read, but sometimes it's missing or "isRead": False
             # We want to be careful: if missing, assume read unless we find unread messages
             is_read_meta = thread_props.get("isRead", True)
@@ -236,17 +273,36 @@ class TeamsExtractor:
                 is_hidden = is_hidden.lower() == "true"
 
             # Determine if unread using both horizon and isRead metadata
-            # To match the user's manual count, we also consider recency (e.g. last 7 days)
-            recent_threshold = datetime.now().timestamp() - (7 * 24 * 3600)
+            horizon = self.consumption_horizons.get(cid, 0)
             
+            # Additional consumption horizon check from conversation record itself
+            conv_props = raw_conv.get("properties", {})
+            conv_horizon_raw = conv_props.get("consumptionhorizon")
+            if conv_horizon_raw:
+                try:
+                    for p in str(conv_horizon_raw).split(';'):
+                        try:
+                            val_f = float(p.strip())
+                            if val_f > horizon:
+                                horizon = val_f
+                        except: continue
+                except:
+                    pass
+
             msgs = sorted(messages_by_conv.get(cid, []), key=lambda x: x.timestamp)
             unread_count = sum(1 for m in msgs if m.is_unread)
             
+            # Heuristic: If last message is after the latest read horizon, it's unread
+            if last_ts_raw > horizon:
+                # We prioritize the calculated unread count, but if it's 0 
+                # (due to missing local messages) and last_ts > horizon, 
+                # we force it to at least 1 to show it's unread.
+                if unread_count == 0:
+                   unread_count = 1
+            
             # If metadata says unread but we found 0 unread messages (horizon issue), 
-            # we should still treat it as unread if it's recent.
-            if not is_read_meta and unread_count == 0 and last_ts.timestamp() > recent_threshold:
-                if msgs:
-                    msgs[-1].is_unread = True
+            # we should still treat it as unread.
+            if not is_read_meta and unread_count == 0:
                 unread_count = 1
 
             # If it's too old (like the Zeb chat from Oct 2025), and user only sees "two",
@@ -260,7 +316,8 @@ class TeamsExtractor:
                 messages=msgs,
                 unread_count=unread_count,
                 is_read_metadata=is_read_meta,
-                hidden=is_hidden
+                hidden=is_hidden,
+                thread_type=thread_type
             ))
 
         return sorted(conversations, key=lambda x: x.last_message_time, reverse=True)

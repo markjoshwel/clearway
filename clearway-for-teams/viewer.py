@@ -106,14 +106,19 @@ class TeamsViewer(App):
                 if not conv.messages and conv.unread_count == 0:
                     continue
                     
+                # [C] for Channel (Topic), [P] for Chat (Personal/Private Group)
+                prefix = "[C]" if conv.thread_type == "Topic" else "[P]"
+                
                 # Use display name or ID, truncate if needed
                 title = conv.title if conv.title else "Unknown"
                 if conv.unread_count > 0:
-                    title = f"{title} [{conv.unread_count}]"
+                    display_text = f"{prefix} {title} [{conv.unread_count}]"
+                else:
+                    display_text = f"{prefix} {title}"
                     
-                if len(title) > 30:
-                    title = title[:27] + "..."
-                conv_list.append(ListItem(Label(title)))
+                if len(display_text) > 30:
+                    display_text = display_text[:27] + "..."
+                conv_list.append(ListItem(Label(display_text)))
             
             if self.conversations:
                 conv_list.index = 0
