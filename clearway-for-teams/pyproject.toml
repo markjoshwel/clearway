@@ -1,0 +1,12 @@
+[project]
+name = "clearway-for-teams"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ccl-chromium-reader",
+]
+
+[tool.uv.sources]
+ccl-chromium-reader = { git = "https://github.com/cclgroupltd/ccl_chromium_reader.git" }
