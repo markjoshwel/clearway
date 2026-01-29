@@ -108,6 +108,9 @@ class TeamsViewer(App):
                     
                 # Use display name or ID, truncate if needed
                 title = conv.title if conv.title else "Unknown"
+                if conv.unread_count > 0:
+                    title = f"{title} [{conv.unread_count}]"
+                    
                 if len(title) > 30:
                     title = title[:27] + "..."
                 conv_list.append(ListItem(Label(title)))

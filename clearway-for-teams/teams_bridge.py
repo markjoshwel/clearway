@@ -23,6 +23,7 @@ class Message:
     content: str
     timestamp: datetime
     conversation_id: str
+    is_unread: bool = False
 
 @dataclass
 class Conversation:
@@ -30,6 +31,7 @@ class Conversation:
     title: str
     last_message_time: datetime
     messages: List[Message]
+    unread_count: int = 0
 
 # --- Extractor Class ---
 
@@ -39,11 +41,13 @@ class TeamsExtractor:
         self.temp_path: Optional[Path] = None
         self.db: Optional[ccl_chromium_indexeddb.IndexedDb] = None
         self.profiles: Dict[str, UserProfile] = {}
+        self.consumption_horizons: Dict[str, float] = {} # conv_id -> timestamp
 
     def __enter__(self):
         self.temp_path = self._copy_db()
         self.db = ccl_chromium_indexeddb.IndexedDb(self.temp_path)
         self._load_profiles()
+        self._load_consumption_horizons()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -79,6 +83,24 @@ class TeamsExtractor:
             email = val.get("mail")
             
             self.profiles[mri] = UserProfile(id=mri, display_name=name, email=email)
+
+    def _load_consumption_horizons(self):
+        db_id = self._find_db_by_name("Teams:replychain-metadata-manager")
+        if db_id is None: return
+        
+        # Store 1 is 'replychainmetadata'
+        for record in self.db.iterate_records(db_id, 1):
+            val = record.value
+            if not val: continue
+            
+            conv_id = val.get("conversationId")
+            # This is the timestamp of the last READ message
+            horizon = val.get("consumptionHorizon")
+            if conv_id and horizon:
+                try:
+                    self.consumption_horizons[conv_id] = float(horizon)
+                except (ValueError, TypeError):
+                    pass
 
     def get_conversations(self) -> List[Conversation]:
         conv_db_id = self._find_db_by_name("Teams:conversation-manager")
@@ -138,13 +160,20 @@ class TeamsExtractor:
                     # Fallback for invalid timestamps
                     ts = datetime.now()
 
+                # Determine if unread
+                is_unread = False
+                horizon = self.consumption_horizons.get(conv_id, 0)
+                if ts_raw > horizon:
+                    is_unread = True
+
                 messages_by_conv[conv_id].append(Message(
                     id=msg_id,
                     sender_id=sender_mri or "unknown",
                     sender_name=sender_name,
                     content=str(content),
                     timestamp=ts,
-                    conversation_id=conv_id
+                    conversation_id=conv_id,
+                    is_unread=is_unread
                 ))
 
         # 3. Assemble
@@ -166,12 +195,14 @@ class TeamsExtractor:
                 last_ts = datetime.now()
             
             msgs = sorted(messages_by_conv.get(cid, []), key=lambda x: x.timestamp)
+            unread_count = sum(1 for m in msgs if m.is_unread)
             
             conversations.append(Conversation(
                 id=cid,
                 title=title,
                 last_message_time=last_ts,
-                messages=msgs
+                messages=msgs,
+                unread_count=unread_count
             ))
 
         return sorted(conversations, key=lambda x: x.last_message_time, reverse=True)

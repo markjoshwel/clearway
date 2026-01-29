@@ -20,8 +20,12 @@ Research has identified the following critical databases and stores:
 | **Messages** | `Teams:replychain-manager` | `replychains` |
 | **User Profiles** | `Teams:profiles` | `profiles` |
 | **Sync State** | `Teams:syncstate-manager` | `syncstates` |
+| **Read Status** | `Teams:replychain-metadata-manager` | `replychainmetadata` |
 
-*Note: Database names include UUIDs and locale strings (e.g., `en-us`). Extraction must use fuzzy matching or iterate all databases to find the correct IDs.*
+### Unread Logic
+Unread messages are determined by comparing the `originalArrivalTimestamp` of a message with the `consumptionHorizon` found in the `replychainmetadata` store for that specific conversation.
+- **Consumption Horizon**: The timestamp (ms) of the last message the user acknowledged as "read".
+- **Unread Rule**: `message.timestamp > conversation.consumptionHorizon`
 
 ### Data Storage
 - **Format**: LevelDB (via Chromium IndexedDB)
