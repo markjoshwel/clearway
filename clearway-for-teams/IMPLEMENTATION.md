@@ -4,73 +4,315 @@
 
 ### Database Location
 
-- **Registry/Path**: `%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\IndexedDB\https_teams.microsoft.com_0.indexeddb.leveldb`
-- **Format**: Chromium IndexedDB (backed by LevelDB).
+Teams stores its data in Chromium's IndexedDB format using LevelDB as the underlying storage engine:
+
+**Windows (Teams 2.x - Current)**:
+```
+%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\WV2Profile_tfw\IndexedDB\https_teams.microsoft.com_0.indexeddb.leveldb
+```
+
+**Format**: Chromium IndexedDB (LevelDB backend). The database consists of multiple `.ldb` files containing binary protobuf data, plus metadata files (`MANIFEST`, `CURRENT`, etc.).
 
 ### Database & Store Mapping
 
-The application spreads data across numerous IndexedDB databases. Key mappings identified:
+Teams spreads data across numerous IndexedDB databases, each identified by a unique database ID. The naming convention includes the database purpose plus user-specific identifiers:
 
-| Content Type | Database Name Snippet | Store Index | Store Name | Key Fields |
-| :--- | :--- | :--- | :--- | :--- |
-| **Channels** | `Teams:conversation-manager` | 1 | `conversations` | `id`, `threadProperties`, `threadType: Topic` |
-| **1:1 / Group Chats** | `Teams:conversation-manager` | 1 | `conversations` | `id`, `threadProperties`, `threadType: Chat` |
-| **Messages Cache** | `Teams:replychain-manager` | 1 | `replychains` | `conversationId`, `originalArrivalTimestamp`, `content` |
-| **Read Markers** | `Teams:replychain-metadata-manager` | 1 | `replychainmetadata` | `conversationId`, `consumptionHorizon` |
-| **User Profiles** | `Teams:profiles` | 1 | `profiles` | `mri`, `displayName`, `mail` |
+| Content Type | Database Name Pattern | Store ID | Key Fields |
+| :--- | :--- | :--- | :--- |
+| **Conversations** | `Teams:conversation-manager:{client}:{user-id}:{locale}` | 1 | `id`, `threadProperties`, `threadType`, `chatTitle`, `lastMessage` |
+| **Messages/Replies** | `Teams:replychain-manager:{client}:{user-id}:{locale}` | 1 | `conversationId`, `replyChainId`, `messageMap`, `consumptionHorizon` |
+| **Read Markers (Legacy)** | `Teams:replychain-metadata-manager:{client}:{user-id}:{locale}` | 1 | `conversationId`, `consumptionHorizon` |
+| **User Profiles** | `Teams:profiles:{client}:{user-id}:{locale}` | 1 | `mri`, `displayName`, `mail` |
+
+**Key Discovery**: Each database name includes dynamic components (client type, user ID, locale), so the code searches for databases by name snippet (e.g., `Teams:conversation-manager`) rather than exact match.
+
+### Data Structure Deep Dive
+
+#### Conversation Records (`Teams:conversation-manager`)
+
+Each conversation record contains:
+
+```python
+{
+  "id": "19:uuid_uuid@unq.gbl.spaces",  # Conversation ID
+  "type": "Chat",  # or "Topic" for channels
+  "threadType": "Chat",
+  "threadProperties": {
+    "isRead": "false",  # Unread indicator
+    "hidden": "false",  # Archive/hidden status
+    # ... other properties
+  },
+  "chatTitle": {  # For 1:1 and group chats
+    "shortTitle": "John Doe",  # Other person's name
+    "longTitle": "John Doe, Jane Smith /IM",  # All participants
+    "avatarUsersInfo": [...]  # User details
+  },
+  "lastMessage": {
+    "content": b'Hello World',  # Raw bytes, often UTF-8
+    "originalArrivalTime": 1769563301037.0  # Unix timestamp (milliseconds)
+  },
+  "lastMessageTimeUtc": 1769563301037.0,
+  "version": 1769563301222.0,  # For deduplication
+  "detailsVersion": 1714382842699.0
+}
+```
+
+**Key Finding**: The `chatTitle` field (not `displayName` or `topic`) contains the human-readable conversation title for direct chats. For channels, `displayName` or `topic` is used.
+
+#### Reply Chain Records (`Teams:replychain-manager`)
+
+Messages are organized in reply chains (threads). Each record represents a reply chain within a conversation:
+
+```python
+{
+  "conversationId": "19:uuid_uuid@unq.gbl.spaces",
+  "replyChainId": "19:uuid_uuid@unq.gbl.spaces",  # Same as conv ID for simple chats
+  "messageMap": {
+    "message-id-1": {
+      "id": "message-id-1",
+      "content": "Hello!",  # or HTML: "<p>Hello!</p>"
+      "contentType": "Text",  # or "Html"
+      "from": "8:orgid:uuid",  # Sender MRI
+      "imDisplayName": "John Doe",  # Sender name (fallback)
+      "originalArrivalTime": 1769563301037.0,  # Milliseconds since epoch
+      "originalArrivalTimestamp": 1769563301037.0,  # Alternative field
+      "isSentByCurrentUser": False
+    }
+  },
+  "consumptionHorizon": "1769563301037;0;0",  # Read marker (semicolon-separated)
+  "consumptionHorizonBookmark": 1769563301037.0
+}
+```
+
+**Critical Discovery**: In current Teams versions, the consumption horizon (read marker) is stored in the `Teams:replychain-manager` database within each reply chain record, NOT in a separate metadata database. The older `Teams:replychain-metadata-manager` database may be empty or unused in newer Teams versions.
+
+#### User Profiles (`Teams:profiles`)
+
+```python
+{
+  "mri": "8:orgid:uuid",  # Machine-readable identifier
+  "displayName": "John Doe",
+  "mail": "john.doe@example.com"
+}
+```
 
 ### Technical Challenges & Logic
 
 #### 1. Database Locking
 
-Chromium DBs are locked when Teams is running.
+Chromium locks the LevelDB files when Teams is running, preventing direct access.
 
-- **Solution**: The bridge copies the entire `.leveldb` folder to `%TEMP%` before opening. The `LOCK` file is ignored during copy.
+**Solution**: Copy the entire `.leveldb` folder to a temporary location (`%TEMP%\teamsdb_*`) before opening. The `LOCK` file is excluded during copy to avoid file lock conflicts.
 
-#### 2. Deduplication & Conflicts
+#### 2. Deduplication & Version Conflicts
 
-Teams stores multiple records for the same conversation ID across different "sources" (e.g., Sources 1, 2, 4).
+Teams stores multiple versions of the same conversation record. Each record has version fields (`version`, `detailsVersion`, `threadVersion`) that increase with updates.
 
-- **Rule**: Sort by `version`, `detailsVersion`, or `threadVersion` descending.
-- **Source Conflict**: If versions are identical, the record with `isRead: False` in `threadProperties` is preferred to ensure unread messages are surfaced.
+**Algorithm**:
+1. Group records by `conversationId`
+2. Keep the record with the highest `version` (or `detailsVersion` as fallback)
+3. If versions are identical, prefer the record where `threadProperties.isRead == False` (unread state takes precedence)
 
-#### 3. Unread Detection (Heuristic Approach)
+#### 3. Unread Detection (Multi-Layer Heuristic)
 
-The "Unread" count in the Teams UI is complex. The bridge uses a multi-layered detection:
+Unread detection is complex because Teams uses multiple indicators:
 
-1. **Multi-part Consumption Horizon**: `consumptionhorizon` is often a semicolon-separated string (e.g., `TS1;TS2;ID`). The bridge parses all segments and treats the maximum valid timestamp as the "read-up-to" threshold.
-2. **Last Message Correlation**: If `lastMessageTimeUtc > max(consumptionHorizon)`, the conversation is flagged as unread even if local message content is missing from the cache.
-3. **Metadata Flag**: `threadProperties.isRead` (Boolean) provides a direct indicator.
-4. **No Recency Filter**: We removed hardcoded recency filters (e.g., 7 days) because Teams UI persists unread status for very old conversations.
+**Layer 1: Consumption Horizon** (Primary)
+- Parse `consumptionHorizon` from reply chain records (semicolon-separated: `timestamp;userId;other`)
+- Use the maximum timestamp as the "read up to" point
+- Messages with `originalArrivalTime > horizon` are unread
 
-#### 4. Channel Title Discovery
+**Layer 2: Conversation Metadata** (Fallback)
+- Check `threadProperties.isRead` field
+- If `"false"`, conversation has unread messages
 
-For Teams (Spaces), the friendly name is often not in the root `displayName` field.
+**Layer 3: Last Message Time** (Heuristic)
+- If `lastMessageTimeUtc > max(consumptionHorizon)` and no unread messages detected, force unread count = 1
 
-- **Solution**: The title extraction logic uses a fallback chain: `displayName > topic > description > spaceThreadTopic`. This ensures Channels like "IMP TM55 Oct 2023" are correctly identified.
+**Layer 4: Message Marking** (Display)
+- When metadata says unread but no horizon exists, mark the most recent message as unread for display purposes
 
-#### 5. `ccl-chromium-reader` API Lessons
+#### 4. Title Extraction Chain
 
-- **Metadata Type**: The `get_database_metadata` method requires `meta_type=1` (integer) to correctly list object stores. Using string constants or incorrect enums can cause execution failures.
+Different conversation types store titles in different fields:
 
-#### 6. Message Enrichment
+**For Direct Chats (1:1)**:
+1. `chatTitle.shortTitle` (preferred - other person's name)
+2. `chatTitle.longTitle` (all participants)
+3. `displayName` (rarely present)
+4. `id` (fallback - conversation ID)
 
-Messages in `replychains` contain MRIs (e.g., `8:orgid:uuid`). The bridge joins these with the `profiles` database to display human-readable names.
+**For Group Chats**:
+1. `chatTitle.longTitle` (all participants)
+2. `chatTitle.shortTitle` (truncated)
+3. `displayName` (if set by user)
+4. `id` (fallback)
+
+**For Channels (Topics)**:
+1. `displayName` (team name)
+2. `topic` (channel name)
+3. Combine as `"Team Name > Channel Name"` if both present
+4. `spaceThreadTopic` or `description` (fallbacks)
+
+#### 5. Timestamp Handling
+
+Teams uses multiple timestamp formats:
+- **Milliseconds since epoch** (most common): `1769563301037.0`
+- **ISO 8601 strings**: `"2026-01-28T01:21:41.037Z"`
+- **Seconds since epoch** (rare): `1769563301`
+
+**Parsing Strategy**:
+- Values > 1e12 are treated as milliseconds (divide by 1000)
+- String values are parsed as ISO 8601 or float
+- Invalid/missing timestamps default to `datetime.now()`
+
+#### 6. Content Format
+
+Message content can be:
+- **Plain text**: `"Hello World"`
+- **HTML**: `"<p>Hello World</p>"`
+- **Raw bytes**: `b'Hello World'` (UTF-8 encoded)
+- **Rich content**: May contain mentions, formatting, etc.
+
+The code handles all formats and leaves HTML as-is (consumer can strip tags if needed).
+
+#### 7. ccl-chromium-reader Integration
+
+The `ccl_chromium_reader` library provides low-level IndexedDB access:
+
+```python
+from ccl_chromium_reader import ccl_chromium_indexeddb
+
+db = ccl_chromium_indexeddb.IndexedDb(db_path)
+
+# Iterate databases
+for db_id in db.global_metadata.db_ids:
+    print(f"DB {db_id.dbid_no}: {db_id.name}")
+
+# Iterate records in a store
+for record in db.iterate_records(database_id, store_id):
+    key = record.key.value  # Record key
+    value = record.value    # Parsed dict or None
+```
+
+**Key Lesson**: The library returns `Undefined` objects for missing fields (not `None`), which must be handled carefully during parsing.
+
+### Conversation ID Patterns
+
+| Pattern | Type | Example |
+| :--- | :--- | :--- |
+| `19:...@unq.gbl.spaces` | Direct/Group Chat | `19:uuid_uuid@unq.gbl.spaces` |
+| `19:...@thread.tacv2` | Channel (Team) | `19:base64@thread.tacv2` |
+| `19:...@thread.v2` | Channel (New) | `19:hex@thread.v2` |
+| `48:...` | System/Internal | `48:annotations`, `48:mentions` |
+| `19:meeting_...@thread.v2` | Meeting | `19:meeting_base64@thread.v2` |
+
+**Filtering Strategy**:
+- Exclude `48:` prefix (system conversations)
+- Exclude `meeting` in ID (meeting chats)
+- Filter by `threadType` field: `Chat` vs `Topic`
 
 ## Project Architecture
 
-- `teams_bridge.py`: Core `TeamsExtractor` class. Handles snapshotting, DB iteration, schema mapping, and unread heuristics.
-- `viewer.py`: Textual-based TUI. Displays a list of conversations with unread indicators.
-- `list_unread_chats.py` / `list_unread_teams_topics.py`: Targeted CLI utilities for quick unread summaries.
+The codebase is organized as a Python package with the following structure:
+
+```
+clearway-for-teams/
+├── libteamsdb/                    # Core database extraction library
+│   ├── libteamsdb/
+│   │   ├── __init__.py           # Public API exports
+│   │   ├── extractor.py          # TeamsDatabaseExtractor class
+│   │   ├── discovery.py          # TeamsDatabaseDiscovery class
+│   │   ├── models.py             # Pydantic models (Conversation, Message, etc.)
+│   │   ├── types.py              # Type wrappers and utilities
+│   │   └── exceptions.py         # Custom exceptions
+│   └── tests/                    # Test suite
+├── list_unread_chats.py          # CLI: List unread direct chats
+├── list_unread_teams_topics.py   # CLI: List unread channel topics
+├── viewer.py                     # Interactive TUI viewer
+└── teams_bridge.py               # Legacy bridge implementation
+```
+
+### Key Components
+
+**TeamsDatabaseDiscovery** (`discovery.py`):
+- Auto-discovers Teams database location on Windows
+- Validates database structure and accessibility
+- Returns `DatabaseLocation` objects with metadata
+
+**TeamsDatabaseExtractor** (`extractor.py`):
+- Context manager for safe database access
+- Copies database to temp location to avoid file locks
+- Loads and deduplicates conversations
+- Calculates unread counts using multi-layer heuristics
+- Joins messages with user profiles for display names
+
+**Data Models** (`models.py`):
+- `Conversation`: Represents a chat/channel with metadata
+- `Message`: Individual message with sender, content, timestamp
+- `UserProfile`: User information (MRI, display name, email)
+- `ThreadType`: Enum for Chat vs Topic vs Meeting
+
+### Usage Examples
+
+**Basic extraction**:
+```python
+from libteamsdb import TeamsDatabaseDiscovery, TeamsDatabaseExtractor
+
+discovery = TeamsDatabaseDiscovery()
+location = discovery.find_first()
+
+with TeamsDatabaseExtractor(location.path) as extractor:
+    conversations = extractor.get_conversations()
+    for conv in conversations:
+        if conv.unread_count > 0:
+            print(f"{conv.title}: {conv.unread_count} unread")
+```
+
+**CLI utilities**:
+```bash
+# List unread direct messages
+uv run list_unread_chats.py
+
+# List unread channel topics
+uv run list_unread_teams_topics.py
+
+# Interactive viewer
+uv run viewer.py
+```
 
 ## Dependencies
 
-- `ccl-chromium-reader`: Essential for parsing Chromium IndexedDB structure.
-- `textual`: Modern TUI framework.
-- `pydantic` / `dataclasses`: For data modeling.
+- **ccl-chromium-reader**: Low-level Chromium IndexedDB parsing (from GitHub)
+- **pydantic**: Data validation and serialization
+- **textual**: Terminal UI framework (for viewer.py)
+- **pytest**: Testing framework
+
+## Development Notes
+
+### Running Tests
+```bash
+uv run pytest libteamsdb/tests/
+```
+
+### Installing in Editable Mode
+```bash
+uv pip install -e ./libteamsdb
+```
+
+### Database Schema Changes
+If Teams updates their database schema:
+1. Use debug scripts to inspect new field names
+2. Update field extraction logic in `extractor.py`
+3. Update `IMPLEMENTATION.md` with new findings
+4. Add regression tests for new fields
 
 ## Known Limitations
 
-- **Read-Only**: No ability to send messages or mark them as read.
-- **Local Cache**: Only displays messages cached locally by the Teams client.
-- **Schema Volatility**: Microsoft internal store structures are subject to change without notice.
+1. **Read-Only Access**: Cannot send messages or mark as read (would require Teams API access)
+2. **Local Cache Only**: Only sees messages cached locally by Teams client (recent conversations)
+3. **Schema Volatility**: Microsoft may change field names/structures without notice
+4. **No Real-Time Updates**: Must re-read database to see new messages
+5. **Hidden Conversations**: Some unread conversations may be marked `hidden: true` (archived)
+6. **Windows Only**: Currently only supports Windows Teams 2.x database paths
+7. **Consumption Horizon**: Some conversations may show as unread but have no consumption horizon (metadata-only unread)
