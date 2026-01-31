@@ -1,0 +1,54 @@
+[project]
+name = "libteamsdb"
+version = "0.1.0"
+description = "A robust library for reading Microsoft Teams IndexedDB data"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0.0",
+    "ccl-chromium-reader",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.8.0",
+    "pytest>=7.0.0",
+]
+
+[tool.uv.sources]
+ccl-chromium-reader = { git = "https://github.com/cclgroupltd/ccl_chromium_reader.git" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["libteamsdb"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+implicit_reexport = false
+strict_equality = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "ccl_chromium_reader.*"
+follow_untyped_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
