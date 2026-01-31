@@ -1,0 +1,10 @@
+[project]
+name = "clearway-for-whatsapp"
+version = "0.1.0"
+description = "Clearway bridge for WhatsApp using Neonize"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "neonize>=0.3.0",
+    "python-dotenv>=1.0.1",
+]
